@@ -19,15 +19,16 @@ use tokio;
 async fn main() {
     start_tcp_server("127.0.0.1:7878");
 
+    let op = Op::WriteOp(WriteKv { key: "name".to_string(), value: "Amey".to_string() });
+
+    let operation = AvailableOperationsOnKv {
+        op: Some(op)
+    };
+
     // Declaration
     let wal = Wal {
         sq_no: 1,
-        operation: Some(AvailableOperationsOnKv {
-            op: Some(Op::WriteOp(WriteKv {
-                key: "name".to_string(),
-                value: "Amey".to_string(),
-            })),
-        }),
+        operation: Some(operation)
     };
 
     //Access

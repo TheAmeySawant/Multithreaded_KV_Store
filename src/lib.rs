@@ -6,8 +6,105 @@ use std::{
     io::ErrorKind,
 };
 use tokio;
+
+//Protocol Buffer Data Structures
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/kvstore.rs"));
+}
+use proto::{
+    AvailableOperationsOnKv, DeleteKv, ReadKv, Wal, WriteKv, available_operations_on_kv::Op,
+};
+
+impl AvailableOperationsOnKv {
+    ///
+    /// # PrepareOperation
+    ///
+    /// PrepareOperation creates AvailableOperationsOnKv instance for the given operation_query.
+    /// Returns Syntax Error if query is incorrect
+    /// ## Example
+    /// ```
+    /// use multithreaded_kv_store::AvailableOperationsOnKv;
+    /// let prepared_operation = AvailableOperationOnKv::prepare_operation;
+    /// ```
+    ///
+    /// # RULES of operation_query
+    ///
+    /// ## Write Operation
+    ///
+    /// "Write \<key\> = \<value\>"
+    ///
+    /// Example:
+    ///
+    /// "Write name = Amey"
+    ///
+    /// ## Read Operation
+    ///
+    /// "Read \<key\>"
+    ///
+    /// Example:
+    ///
+    /// "Read name"
+    ///
+    /// ## Delete Operation
+    ///
+    /// "Delete \<key\>"
+    ///
+    /// Example:
+    ///
+    /// "Delete name"
+    ///
+    /// ## Keywords
+    /// Write, Read, Delete keywords are case-insensitive
+    ///
+    /// ## Keys and Values
+    /// Keys i.e \<key\> and Values i.e \<value\> are case-sensitive
+    ///
+    /// i.e name, Name, NAme are not equal, therefore, 3 distinct keys
+    ///
+    pub fn prepare_operation(operation_query: &str) -> Result<Self, String> {
+        // let operation_query_lowered = operation_query.to_lowercase();
+        let query_list: Vec<&str> = operation_query.split(' ').collect();
+
+        if let Some(op_from_query) = query_list.get(0) {
+            let op: Op;
+            let op_from_query_lowered = &op_from_query.to_lowercase()[..];
+
+            match op_from_query_lowered {
+                "write" => {
+                    if query_list.len() != 4 || query_list.get(2) != Some(&"=") {
+                        return Err("Write Operation Syntax Error \n".to_string());
+                    }
+                    op = Op::WriteOp(WriteKv {
+                        key: query_list.get(1).expect("Write Syntax Error").to_string(),
+                        value: query_list.get(3).expect("Write Syntax Error").to_string(),
+                    });
+                }
+                "read" => {
+                    if query_list.len() != 2 {
+                        return Err("Read Operation Syntax Error \n".to_string());
+                    }
+                    op = Op::ReadOp(ReadKv {
+                        key: query_list.get(1).expect("Read Syntax Error").to_string(),
+                    });
+                }
+                "delete" => {
+                    if query_list.len() != 2 {
+                        return Err("Delete Operation Syntax Error \n".to_string());
+                    }
+                    op = Op::ReadOp(ReadKv {
+                        key: query_list.get(1).expect("Delete Syntax Error").to_string(),
+                    });
+                }
+                _ => {
+                    return Err("Syntax Error:\nIllegal Query, Coundn't find any operation in query, please write query using correct syntax.".to_string());
+                }
+            }
+
+            Ok(AvailableOperationsOnKv { op: Some(op) })
+        } else {
+            return Err("Syntax Error:\nIllegal Query, Coundn't find any operation in query, please write query using correct syntax.".to_string());
+        }
+    }
 }
 
 // /// ### Operation
@@ -32,7 +129,6 @@ struct MemStorage {
     sq_no: u64, //Sequence Number
     mem_storage: HashMap<String, String>,
 }
-
 
 /// ## StoreEngine
 /// StoreEngine manages respective Project's KV Store.
@@ -68,7 +164,7 @@ pub struct StoreEngine {
     /// ### snapshot
     /// snapshot is the HashMap stored in a file
     /// snapshot.bin is stored in a snapshots folder
-    snapshot_file: Option<File>
+    snapshot_file: Option<File>,
 }
 
 impl StoreEngine {
@@ -117,11 +213,9 @@ impl StoreEngine {
         }
     }
 
-    fn recovery_restart(project_name: &str, file: File, ) -> Self {
+    fn recovery_restart(project_name: &str, file: File) -> Self {
         //Recovery code goes here
         //Recovery means getting the in_memory_storage in the correct latest state using logs and snapshots
-        
-
 
         return StoreEngine {
             project_name: project_name.to_string(),
@@ -131,9 +225,7 @@ impl StoreEngine {
                 mem_storage: HashMap::new(),
             },
             wal_file: file,
-            snapshot_file: None
+            snapshot_file: None,
         };
-
     }
-
 }
