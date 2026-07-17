@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package kvstore;
+
+// Write Operation
+message WriteKV {
+  string key = 1;
+  string value = 2;
+}
+
+// Delete Operation
+message DeleteKV {
+  string key = 1;
+}
+
+// Read Operation
+message ReadKV {
+  string key = 1;
+}
+
+// Available Operations
+message AvailableOperationsOnKV {
+  oneof op {
+    WriteKV write_op = 1;
+    ReadKV read_op = 2;
+    DeleteKV delete_op = 3;
+  }
+}
+
+// WAL Record
+message WAL {
+  uint64 sq_no = 1;
+  AvailableOperationsOnKV operation = 2;
+}
+
+
