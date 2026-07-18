@@ -11,7 +11,7 @@ use tokio;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/kvstore.rs"));
 }
-use proto::{
+pub use proto::{
     AvailableOperationsOnKv, DeleteKv, ReadKv, Wal, WriteKv, available_operations_on_kv::Op,
 };
 
@@ -91,7 +91,7 @@ impl AvailableOperationsOnKv {
                     if query_list.len() != 2 {
                         return Err("Delete Operation Syntax Error \n".to_string());
                     }
-                    op = Op::ReadOp(ReadKv {
+                    op = Op::DeleteOp(DeleteKv {
                         key: query_list.get(1).expect("Delete Syntax Error").to_string(),
                     });
                 }
