@@ -1,9 +1,8 @@
 // Inbuild libs
 use prost::Message;
+use tokio::time::interval;
 use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions, create_dir_all},
-    io::{ErrorKind, Write}
+    collections::HashMap, fs::{File, OpenOptions, create_dir_all}, io::{ErrorKind, Write}, sync::{Arc, Mutex}, time::Duration,
 };
 
 //Protocol Buffer Data Structures
@@ -82,23 +81,47 @@ pub struct KvOutput {
     value: String,
 }
 
+/// This keeps track of Access to KvStore \[StoreEngine\]
+#[derive(Debug)]
+struct AccessTracker{
+    
+    /// We will check ususally after 2 minutes if this accessed,
+    ///
+    /// **Not Accessed**: Flush from Memory
+    ///
+    /// **Accessed**: Calculate Avg and set ** back to 0
+    current_access_count: u64,
+
+    /// Average Number of time accessed per minute
+    avg_access_per_minute: u64,
+
+    /// Count of Intervals Passed
+    intervals_count: u64
+}
+
+impl AccessTracker {
+    fn new() -> Self{
+        AccessTracker { current_access_count: 0, avg_access_per_minute: 0, intervals_count: 0 }
+    }
+}
+
 /// ## StoreEngine
-/// StoreEngine manages respective Project's KV Store.
+/// StoreEngine manages respective KV Store.
 ///
-/// StoreEngine creates a 'projects/project_name' folder consisting of it's WAL log and latest snapshot.
+/// StoreEngine creates a 'projects/kv_store_name' folder consisting of it's WAL log and latest snapshot.
 ///
-/// Maintains ThreadPool, WAL.log, snapshot.bin, recovery, etc.
+/// Maintains WAL.log, snapshot.bin, recovery, etc.
 ///
 /// # Example
 /// ```
 /// use multithreaded_kv_store::StoreEngine;
 ///
-/// let my_kv_store_engine = StoreEngine::new("my_kv");
+/// let my_kv_store_engine = StoreEngine::connect("my_kv");
 ///
 /// ```
 #[derive(Debug)]
 pub struct StoreEngine {
-    project_name: String,
+    kv_store_name: String,
 
     /// ### next_seq_no
     ///
@@ -117,18 +140,20 @@ pub struct StoreEngine {
     /// snapshot is the HashMap stored in a file
     /// snapshot.bin is stored in a snapshots folder
     snapshot_file: Option<File>,
+
+    access_tracker: AccessTracker
 }
 
 impl StoreEngine {
-    /// connect() associative function connects to instance of StoreEngine for the given 'project_name'
+    /// connect() associative function connects to instance of StoreEngine for the given 'kv_store_name'
     /// project is part of Store
     ///
     /// # Example
     /// ```
     /// let my_kv_store_engine = StoreEngine::connect("my_kv");
     /// ```
-    pub fn connect(project_name: &str) -> Result<Self, String> {
-        let wal_folder_path = format!("projects/{project_name}/wal");
+    pub fn connect(kv_store_name: &str) -> Result<Self, String> {
+        let wal_folder_path = format!("projects/{kv_store_name}/wal");
 
         if let Err(e) = create_dir_all(&wal_folder_path) {
             return Err(get_err(format!(
@@ -146,12 +171,12 @@ impl StoreEngine {
             .open(&wal_file_path)
         {
             Ok(file) => {
-                println!("Starting {project_name} KV Store's Recovery!");
-                return Ok(StoreEngine::recovery_restart(project_name, file));
+                println!("Starting {kv_store_name} KV Store's Recovery!");
+                return Ok(StoreEngine::recovery_restart(kv_store_name, file));
             }
 
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                println!("Creating {project_name} KV Store!!");
+                println!("Creating {kv_store_name} KV Store!!");
 
                 match OpenOptions::new()
                     .create_new(true) // Fail if file exists
@@ -160,7 +185,7 @@ impl StoreEngine {
                 {
                     Ok(wal_file) => {
                         let store_engine = StoreEngine {
-                            project_name: project_name.to_string(),
+                            kv_store_name: kv_store_name.to_string(),
                             next_seq_no: 1, //This has to be a natural number i.e > 0, even 0 is not allowed
                             in_memory_storage: MemStorage {
                                 sq_no: 0, //for now this value doesn't really matter
@@ -168,11 +193,12 @@ impl StoreEngine {
                             },
                             wal_file,
                             snapshot_file: None,
+                            access_tracker: AccessTracker::new()
                         };
                         Ok(store_engine)
                     }
                     Err(e) => Err(get_err(format!(
-                        "Error Occured while creating new wal.log for {project_name} project\n{e}"
+                        "Error Occured while creating new wal.log for {kv_store_name} project\n{e}"
                     ))),
                 }
             }
@@ -185,12 +211,12 @@ impl StoreEngine {
         }
     }
 
-    fn recovery_restart(project_name: &str, file: File) -> Self {
+    fn recovery_restart(kv_store_name: &str, file: File) -> Self {
         //Recovery code goes here
         //Recovery means getting the in_memory_storage in the correct latest state using logs and snapshots
 
         return StoreEngine {
-            project_name: project_name.to_string(),
+            kv_store_name: kv_store_name.to_string(),
             next_seq_no: 1, //This has to be a natural number i.e > 0, even 0 is not allowed
             in_memory_storage: MemStorage {
                 sq_no: 0, //for now this value doesn't really matter
@@ -198,6 +224,7 @@ impl StoreEngine {
             },
             wal_file: file,
             snapshot_file: None,
+            access_tracker: AccessTracker::new()
         };
     }
 
@@ -309,6 +336,9 @@ impl StoreEngine {
         &mut self,
         mut operation: AvailableOperationsOnKv,
     ) -> Result<Option<KvOutput>, String> {
+
+        self.access_tracker.current_access_count += 1;
+
         match operation.op.take() {
             Some(op) => {
                 match op {
@@ -379,7 +409,7 @@ impl StoreEngine {
         if let Err(e) = self.wal_file.write_all(&wal_buf) {
             return Err(get_err(format!(
                 "Error Occured while writing wal buffer on wal.log file of {} project\n{e}",
-                &self.project_name
+                &self.kv_store_name
             )));
         }
 
@@ -388,11 +418,105 @@ impl StoreEngine {
         if let Err(e) = self.wal_file.sync_data() {
             return Err(get_err(format!(
                 "Error Occured while syncing the wal.log file of {} project\n{e}",
-                &self.project_name
+                &self.kv_store_name
             )));
         }
         Ok(())
     }
+}
+
+pub struct Stores {
+    inner: Mutex<HashMap<String, Arc<Mutex<StoreEngine>>>>,
+}
+
+/// A HashMap of currently active StoreEngines
+pub type StoresMap = Arc<Stores>;
+
+impl Stores {
+    pub fn new() -> Self {
+        Stores {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Inserts KvStore of kv_store_name in the StoresMap
+    /// ## Example
+    /// ```
+    /// // Define StoresMap
+    /// let mut stores_map:StoresMap;
+    ///
+    /// stores_map.insert("my_kv").unwrap();
+    /// ```
+    pub async fn insert(&mut self, kv_store_name: &str) -> Result<(), String> {
+        let store_engine: StoreEngine = StoreEngine::connect(kv_store_name)?;
+
+        let mut stores_map = self.inner.lock().unwrap();
+
+        stores_map.insert(
+            kv_store_name.to_string(),
+            Arc::new(Mutex::new(store_engine)),
+        );
+
+        Ok(())
+    }
+
+    /// fetches the StoreEnigne of the given kv_store_name from the StoresMap
+    /// ## Example
+    /// ```
+    /// // Fetch & use from Stores
+    /// let stores = stores_map.clone();
+    ///
+    /// let fetch = move || {
+    ///     let stores = stores.lock().unwrap(); // <-- HashMap lock acquired here
+    ///
+    ///     stores.get("store1").clone() // returns the StoreEnigne's Arc pointer
+    /// }; // <-- HashMap lock released here
+    ///
+    /// // Get lock of the StoreEnigne
+    /// let mut engine = fetch().lock().unwrap();
+    ///
+    /// engine.execute_operation(...);
+    ///  
+    /// ```
+    pub fn get(&self, kv_store_name: &str) -> Option<Arc<Mutex<StoreEngine>>> {
+        let stores_map = self.inner.lock().unwrap();
+
+        if let Some(locked_store_engine) = stores_map.get(kv_store_name) {
+            Some(Arc::clone(locked_store_engine))
+        } else {
+            None
+        }
+    }
+}
+
+pub fn spawn_access_tracker(stores_map: StoresMap, interval_in_seconds: Option<u64>) {
+    let interval_in_seconds = match interval_in_seconds {
+        Some(secs) => secs,
+        None => 120 //Default 2 minutes
+    };
+    
+    tokio::spawn(async move {
+        let mut timer = interval(Duration::from_secs(interval_in_seconds));
+
+        loop {
+            timer.tick().await;
+
+            let mut stores_map_guard = stores_map.inner.lock().unwrap();
+
+            stores_map_guard.retain(|kv_store_name, store_engine| {
+                let mut store_engine = store_engine.lock().unwrap();
+
+                if store_engine.access_tracker.current_access_count != 0 {
+                    store_engine.access_tracker.avg_access_per_minute += (store_engine.access_tracker.current_access_count - store_engine.access_tracker.avg_access_per_minute) / store_engine.access_tracker.intervals_count;
+                    store_engine.access_tracker.current_access_count = 0;
+                    store_engine.access_tracker.intervals_count += 1;
+                    true
+                }else{
+                    false
+                }
+            });
+        }
+    });
 }
 
 /// ## get_err()
@@ -400,10 +524,10 @@ impl StoreEngine {
 ///
 /// ### Example
 /// ```
-/// fn foo() -> Result<StoreEnigne, String> {
+/// fn foo(wal: Wal) -> Result<Vec<u8>, String> {
 ///
 ///     let mut buf = Vec::new();
-///     if let Err(e) = operation.encode(&mut buf) {
+///     if let Err(e) = wal.encode(&mut buf) {
 ///         return Err(get_err(format!(
 ///             "Error Occured while encoding operation into 8bit buffer (vec<u8>)\n{e}"
 ///         )));
