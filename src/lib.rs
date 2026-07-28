@@ -1,9 +1,16 @@
 // Inbuild libs
 use prost::Message;
-use tokio::time::interval;
 use std::{
-    collections::HashMap, fs::{File, OpenOptions, create_dir_all}, io::{ErrorKind, Write}, sync::{Arc, Mutex}, time::Duration,
+    collections::HashMap,
+    fs::{File, OpenOptions, create_dir_all},
+    io::{ErrorKind, Write},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
+use tokio::{runtime::Handle, task::JoinHandle, time::interval};
 
 //Protocol Buffer Data Structures
 pub mod proto {
@@ -12,6 +19,66 @@ pub mod proto {
 pub use proto::{DeleteKv, ReadKv, Wal, WriteKv, available_operations_on_kv::Op};
 
 use proto::AvailableOperationsOnKv;
+
+#[derive(Clone)]
+pub struct AppState {
+    stores_map: StoresMap,
+    access_tracker_flag: Arc<AtomicBool>, // true -> Working/On , false -> Stopped/Off
+}
+
+impl AppState {
+    pub fn new() -> AppState{
+
+        AppState{
+            stores_map: StoresMap::new(Mutex::new(Stores::new())),
+            access_tracker_flag: Arc::new(AtomicBool::new(false))
+        }
+    }
+
+    pub fn get_stores_map_clone(&self) -> StoresMap {
+        Arc::clone(&self.stores_map)
+    }
+
+    /// access_tracker stops
+    pub fn stop_access_tracker(&mut self) {
+        self.access_tracker_flag.store(false, Ordering::Release);
+    }
+
+    pub fn spawn_access_tracker(&self, interval_in_seconds: Option<u64>) {
+        let interval_in_seconds = match interval_in_seconds {
+            Some(secs) => secs,
+            None => 120, //Default 2 minutes
+        };
+
+        // set access_tracker_flag = true
+        self.access_tracker_flag.store(true, Ordering::Release);
+
+        let stores_map = Arc::clone(&self.stores_map);
+        let access_tracker_flag = Arc::clone(&self.access_tracker_flag);
+
+        tokio::spawn(async move {
+            let mut timer = interval(Duration::from_secs(interval_in_seconds));
+
+            loop {
+                // Check Access Tracker Flag
+                if !(access_tracker_flag.load(Ordering::Acquire)) {
+                    break;
+                }
+
+                timer.tick().await;
+
+                // Check Access Tracker Flag
+                if !(access_tracker_flag.load(Ordering::Acquire)) {
+                    break;
+                }
+
+                let mut stores_map_guard = stores_map.lock().unwrap();
+
+                stores_map_guard.update_access_tracker();
+            }
+        });
+    }
+}
 
 // /// ### Operation
 // /// Available Operations that can be performed on the KV Store
@@ -83,8 +150,7 @@ pub struct KvOutput {
 
 /// This keeps track of Access to KvStore \[StoreEngine\]
 #[derive(Debug)]
-struct AccessTracker{
-    
+struct AccessTracker {
     /// We will check ususally after 2 minutes if this accessed,
     ///
     /// **Not Accessed**: Flush from Memory
@@ -96,12 +162,16 @@ struct AccessTracker{
     avg_access_per_minute: u64,
 
     /// Count of Intervals Passed
-    intervals_count: u64
+    intervals_count: u64,
 }
 
 impl AccessTracker {
-    fn new() -> Self{
-        AccessTracker { current_access_count: 0, avg_access_per_minute: 0, intervals_count: 0 }
+    fn new() -> Self {
+        AccessTracker {
+            current_access_count: 0,
+            avg_access_per_minute: 0,
+            intervals_count: 0,
+        }
     }
 }
 
@@ -141,7 +211,7 @@ pub struct StoreEngine {
     /// snapshot.bin is stored in a snapshots folder
     snapshot_file: Option<File>,
 
-    access_tracker: AccessTracker
+    access_tracker: AccessTracker,
 }
 
 impl StoreEngine {
@@ -193,7 +263,7 @@ impl StoreEngine {
                             },
                             wal_file,
                             snapshot_file: None,
-                            access_tracker: AccessTracker::new()
+                            access_tracker: AccessTracker::new(),
                         };
                         Ok(store_engine)
                     }
@@ -224,7 +294,7 @@ impl StoreEngine {
             },
             wal_file: file,
             snapshot_file: None,
-            access_tracker: AccessTracker::new()
+            access_tracker: AccessTracker::new(),
         };
     }
 
@@ -336,7 +406,6 @@ impl StoreEngine {
         &mut self,
         mut operation: AvailableOperationsOnKv,
     ) -> Result<Option<KvOutput>, String> {
-
         self.access_tracker.current_access_count += 1;
 
         match operation.op.take() {
@@ -425,17 +494,19 @@ impl StoreEngine {
     }
 }
 
+#[derive(Debug)]
 pub struct Stores {
-    inner: Mutex<HashMap<String, Arc<Mutex<StoreEngine>>>>,
+    inner: HashMap<String, Arc<Mutex<StoreEngine>>>,
 }
 
 /// A HashMap of currently active StoreEngines
-pub type StoresMap = Arc<Stores>;
+pub type StoresMap = Arc<Mutex<Stores>>;
 
 impl Stores {
-    pub fn new() -> Self {
+    /// Creates new instance of Stores
+    pub fn new() -> Stores {
         Stores {
-            inner: Mutex::new(HashMap::new()),
+            inner: HashMap::new(),
         }
     }
 
@@ -445,14 +516,12 @@ impl Stores {
     /// // Define StoresMap
     /// let mut stores_map:StoresMap;
     ///
-    /// stores_map.insert("my_kv").unwrap();
+    /// stores_map.insert("my_kv").await.unwrap();
     /// ```
-    pub async fn insert(&mut self, kv_store_name: &str) -> Result<(), String> {
+    pub fn insert(&mut self, kv_store_name: &str) -> Result<(), String> {
         let store_engine: StoreEngine = StoreEngine::connect(kv_store_name)?;
 
-        let mut stores_map = self.inner.lock().unwrap();
-
-        stores_map.insert(
+        self.inner.insert(
             kv_store_name.to_string(),
             Arc::new(Mutex::new(store_engine)),
         );
@@ -479,44 +548,30 @@ impl Stores {
     ///  
     /// ```
     pub fn get(&self, kv_store_name: &str) -> Option<Arc<Mutex<StoreEngine>>> {
-        let stores_map = self.inner.lock().unwrap();
-
-        if let Some(locked_store_engine) = stores_map.get(kv_store_name) {
+        if let Some(locked_store_engine) = self.inner.get(kv_store_name) {
             Some(Arc::clone(locked_store_engine))
         } else {
             None
         }
     }
-}
 
-pub fn spawn_access_tracker(stores_map: StoresMap, interval_in_seconds: Option<u64>) {
-    let interval_in_seconds = match interval_in_seconds {
-        Some(secs) => secs,
-        None => 120 //Default 2 minutes
-    };
-    
-    tokio::spawn(async move {
-        let mut timer = interval(Duration::from_secs(interval_in_seconds));
+    pub fn update_access_tracker(&mut self) {
+        self.inner.retain(|_, store_engine| {
+            let mut store_engine = store_engine.lock().unwrap();
 
-        loop {
-            timer.tick().await;
-
-            let mut stores_map_guard = stores_map.inner.lock().unwrap();
-
-            stores_map_guard.retain(|kv_store_name, store_engine| {
-                let mut store_engine = store_engine.lock().unwrap();
-
-                if store_engine.access_tracker.current_access_count != 0 {
-                    store_engine.access_tracker.avg_access_per_minute += (store_engine.access_tracker.current_access_count - store_engine.access_tracker.avg_access_per_minute) / store_engine.access_tracker.intervals_count;
-                    store_engine.access_tracker.current_access_count = 0;
-                    store_engine.access_tracker.intervals_count += 1;
-                    true
-                }else{
-                    false
-                }
-            });
-        }
-    });
+            if store_engine.access_tracker.current_access_count != 0 {
+                store_engine.access_tracker.avg_access_per_minute +=
+                    (store_engine.access_tracker.current_access_count
+                        - store_engine.access_tracker.avg_access_per_minute)
+                        / store_engine.access_tracker.intervals_count;
+                store_engine.access_tracker.current_access_count = 0;
+                store_engine.access_tracker.intervals_count += 1;
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 /// ## get_err()
@@ -534,7 +589,7 @@ pub fn spawn_access_tracker(stores_map: StoresMap, interval_in_seconds: Option<u
 ///     }
 /// }
 /// ```
-fn get_err(err: String) -> String {
+pub fn get_err(err: String) -> String {
     println!("{}", &err);
     return err;
 }

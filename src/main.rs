@@ -1,20 +1,32 @@
+// Standard Library
 use std::{
-    fs, io::{BufRead, BufReader, ErrorKind, Write}, net::{TcpListener, TcpStream}, sync::{Arc, LazyLock, Mutex}, thread, time::Duration, vec,
+    collections::HashMap, fs, io::{BufRead, BufReader, ErrorKind, Write}, net::{TcpListener, TcpStream}, sync::{Arc, LazyLock, Mutex}, thread, time::Duration, vec,
 };
 
-use multithreaded_kv_store::StoreEngine;
+// Internal Modules
+use multithreaded_kv_store::{AppState, StoreEngine, Stores, StoresMap, get_err};
+mod api;
 
+// External Modules
 use tokio;
+
+use crate::api::start_axum_tcp_server;
+
 
 // GLOBALS
 static INTERNAL_SERVER_ERROR_500:LazyLock<String> = LazyLock::new(|| {
     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {length} \r\n\r\n Internal Server Error Occured. Please Try again later".to_string()
 });
 
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    start_tcp_server("127.0.0.1:7878");
+    let app_state = AppState::new();
+    if let Err(e) = start_axum_tcp_server("127.0.0.1:7878", app_state).await {
+        eprintln!("{e}");
+    }
+    
+
+    // start_tcp_server("127.0.0.1:7878");
 }
 
 /// start_tcp_server function starts server
