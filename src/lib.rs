@@ -5,12 +5,12 @@ use std::{
     fs::{File, OpenOptions, create_dir_all},
     io::{ErrorKind, Write},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
-use tokio::{runtime::Handle, task::JoinHandle, time::interval};
+use tokio::time::interval;
 
 //Protocol Buffer Data Structures
 pub mod proto {
@@ -23,15 +23,15 @@ use proto::AvailableOperationsOnKv;
 #[derive(Clone)]
 pub struct AppState {
     stores_map: StoresMap,
-    access_tracker_flag: Arc<AtomicBool>, // true -> Working/On , false -> Stopped/Off
+    /// true -> Working/On , false -> Stopped/Off
+    access_tracker_flag: Arc<AtomicBool>,
 }
 
 impl AppState {
-    pub fn new() -> AppState{
-
-        AppState{
+    pub fn new() -> AppState {
+        AppState {
             stores_map: StoresMap::new(Mutex::new(Stores::new())),
-            access_tracker_flag: Arc::new(AtomicBool::new(false))
+            access_tracker_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -44,6 +44,7 @@ impl AppState {
         self.access_tracker_flag.store(false, Ordering::Release);
     }
 
+    /// Spawns a looping task which resets current_access_count and calculates avg_access_count after each *interval_in_seconds*
     pub fn spawn_access_tracker(&self, interval_in_seconds: Option<u64>) {
         let interval_in_seconds = match interval_in_seconds {
             Some(secs) => secs,
@@ -139,13 +140,17 @@ impl MemStorage {
             None => None,
         }
     }
+
+    fn fetch_all(&self) -> HashMap<String, String> {
+        self.mem_storage.clone()
+    }
 }
 
 /// ## KvOutput
 /// KvOutput is the output containing the key-value pair after performing operation on KV Store via StoreEngine
 pub struct KvOutput {
-    key: String,
-    value: String,
+    pub key: String,
+    pub value: String,
 }
 
 /// This keeps track of Access to KvStore \[StoreEngine\]
@@ -298,9 +303,7 @@ impl StoreEngine {
         };
     }
 
-    /// # PrepareOperation
-    ///
-    /// PrepareOperation returns an AvailableOperationsOnKv instance for the given operation_query.
+    /// *prepare_operation* returns an *AvailableOperationsOnKv* instance for the given *operation_query*.
     /// Returns Syntax Error if query is incorrect
     /// ## Example
     /// ```
@@ -334,23 +337,31 @@ impl StoreEngine {
     ///
     /// "Delete name"
     ///
+    /// ## Fetch All Operation
+    ///
+    /// "Fetch All"
+    ///
+    ///
     /// ## Keywords
-    /// Write, Read, Delete keywords are case-insensitive
+    /// Write, Read, Delete, etc,. keywords are case-insensitive
     ///
     /// ## Keys and Values
     /// Keys i.e \<key\> and Values i.e \<value\> are case-sensitive
     ///
     /// i.e name, Name, NAme are not equal, therefore, 3 distinct keys
     ///
-    pub fn prepare_operation(operation_query: &str) -> Result<AvailableOperationsOnKv, String> {
+    pub fn prepare_operation(
+        &self,
+        operation_query: &str,
+    ) -> Result<AvailableOperationsOnKv, String> {
         // let operation_query_lowered = operation_query.to_lowercase();
         let query_list: Vec<&str> = operation_query.split(' ').collect();
 
-        if let Some(op_from_query) = query_list.get(0) {
+        if let Some(operation_from_query) = query_list.get(0) {
             let op: Op;
-            let op_from_query_lowered = &op_from_query.to_lowercase()[..];
+            let operation_from_query_lowered = &operation_from_query.to_lowercase()[..];
 
-            match op_from_query_lowered {
+            match operation_from_query_lowered {
                 "write" => {
                     if query_list.len() != 4 || query_list.get(2) != Some(&"=") {
                         return Err("Write Operation Syntax Error \n".to_string());
@@ -377,7 +388,7 @@ impl StoreEngine {
                     });
                 }
                 _ => {
-                    return Err("Syntax Error:\nIllegal Query, Coundn't find any operation in query, please write query using correct syntax.".to_string());
+                    return Err("Syntax Error:\nIllegal Query, Coundn't find any operation in the provided query, please write query using correct syntax.".to_string());
                 }
             }
 
@@ -411,15 +422,10 @@ impl StoreEngine {
         match operation.op.take() {
             Some(op) => {
                 match op {
-                    //No need to write on log, as reading doesn't make any changes in the state of KvStore.
-                    Op::ReadOp(read_op) => match self.in_memory_storage.read(read_op.key) {
-                        Some(output) => {
-                            return Ok(Some(output));
-                        }
-                        None => {
-                            return Ok(None);
-                        }
-                    },
+                    //No need to 'write/append on log', as reading doesn't make any changes in the state of KvStore.
+                    Op::ReadOp(read_op) => Ok(self.in_memory_storage.read(read_op.key)),
+
+                    //For WriteOp and DeleteOp we must write/append these operations on log (file), making sure that the state of KvStore is recoverable
                     Op::WriteOp(write_kv) => match self.record_on_wal_log(&operation) {
                         Ok(()) => {
                             let output: KvOutput = self.in_memory_storage.write(
@@ -459,6 +465,70 @@ impl StoreEngine {
         // Ok(())
     }
 
+    /// ## Returns
+    ///
+    /// *KvOutput* if key **exists**,
+    /// otherwise *None*
+    pub fn read(&self, key: String) -> Option<KvOutput> {
+        self.in_memory_storage.read(key)
+    }
+
+    /// ## Returns
+    ///
+    /// Ok -> Some -> *KvOutput* when write is successful,
+    ///
+    /// *Err(e)* when Error occurs, failing the write operation
+    pub fn write(&mut self, key: String, value: String) -> Result<Option<KvOutput>, String> {
+        let op = Op::WriteOp(WriteKv {
+            key: key.clone(),
+            value: value.clone(),
+        });
+
+        let operation = AvailableOperationsOnKv { op: Some(op) };
+
+        // also records the sequence number in the log
+        match self.record_on_wal_log(&operation) {
+            Ok(()) => {
+                let output: KvOutput = self.in_memory_storage.write(key, value, self.next_seq_no);
+
+                self.next_seq_no += 1;
+
+                return Ok(Some(output));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    /// ## Returns
+    ///
+    /// Ok -> Some -> *KvOutput* if key **exists** and delete operation is **successful**,
+    ///
+    /// Ok -> None if key doesn't **exists** in the KvStore
+    ///
+    /// *Err(e)* when Error occurs, failing the delete operation
+    pub fn delete(&mut self, key: String) -> Result<Option<KvOutput>, String> {
+        let op = Op::DeleteOp(DeleteKv { key: key.clone() });
+
+        let operation = AvailableOperationsOnKv { op: Some(op) };
+
+        match self.record_on_wal_log(&operation) {
+            Ok(()) => match self.in_memory_storage.delete(key, self.next_seq_no) {
+                Some(output) => {
+                    self.next_seq_no += 1;
+                    return Ok(Some(output));
+                }
+                None => {
+                    self.next_seq_no += 1;
+                    return Ok(None);
+                }
+            },
+            Err(e) => return Err(e),
+        }
+    }
+
+    pub fn fetch_all(&self) -> HashMap<String, String> {
+        self.in_memory_storage.fetch_all()
+    }
     fn record_on_wal_log(&mut self, operation: &AvailableOperationsOnKv) -> Result<(), String> {
         let wal = Wal {
             sq_no: self.next_seq_no,
@@ -510,7 +580,7 @@ impl Stores {
         }
     }
 
-    /// Inserts KvStore of kv_store_name in the StoresMap
+    /// Inserts KvStore of *kv_store_name* in the StoresMap
     /// ## Example
     /// ```
     /// // Define StoresMap
@@ -548,6 +618,7 @@ impl Stores {
     ///  
     /// ```
     pub fn get(&self, kv_store_name: &str) -> Option<Arc<Mutex<StoreEngine>>> {
+        println!("{:#?}", self.inner);
         if let Some(locked_store_engine) = self.inner.get(kv_store_name) {
             Some(Arc::clone(locked_store_engine))
         } else {
