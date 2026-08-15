@@ -3,14 +3,14 @@ use axum::{
     extract::{Path, State},
     response::{Html, IntoResponse},
 };
-use multithreaded_kv_store::AppState;
+use multithreaded_kv_store::{AppState, StoreEngine};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct NewKV {
     pub key: String,
     pub value: String,
@@ -50,40 +50,99 @@ pub async fn get_home() -> impl IntoResponse {
 }
 
 #[axum::debug_handler]
-pub async fn create_kv(State(app_state): State<AppState>) -> impl IntoResponse {
+pub async fn create_kv(
+    State(app_state): State<Arc<AppState>>,
+    Path(kv_store_name): Path<String>,
+) -> impl IntoResponse {
     println!("/create_kv called!");
     let stores_map = app_state.get_stores_map_clone();
 
-    let mut stores_map_guard = stores_map.lock().unwrap();
+    match StoreEngine::connect(&kv_store_name, 65000) {
+        Ok(store_engine) => {
+            let mut stores_map_guard = stores_map.write().await;
 
-    if let Ok(()) = stores_map_guard.insert("my_kv") {
-        println!("{stores_map_guard:#?}");
+            stores_map_guard.insert(&kv_store_name, store_engine);
 
-        Json(json!({
+            println!("{stores_map_guard:#?}");
+
+            Json(json!({
+                "status": "ok",
+                "message": "Server is running"
+            }))
+        }
+        Err(e) => Json(json!({
             "status": "ok",
-            "message": "Server is running"
-        }))
-    } else {
-        Json(json!({
-            "status": "ok",
-            "message": "Server is running"
-        }))
+            "message": "Server is running",
+            "error": e
+        })),
     }
 }
 
+#[axum::debug_handler]
 pub async fn read_value(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Path((kv_store_name, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    println!("/{kv_store_name}/read/{key} CALLED");
     let stores_map = app_state.get_stores_map_clone();
 
-    let stores_map_guard = stores_map.lock().unwrap();
+    let kv_store = {
+        let stores_map_guard = stores_map.read().await;
+        stores_map_guard.get(&kv_store_name).clone()
+    };
 
-    match stores_map_guard.get(&kv_store_name) {
-        Some(kv_store) => {
-            let kv_store_guard = kv_store.lock().unwrap();
+    match kv_store {
+        Some(kv_store) => match kv_store.read(key).await {
+            Some(kv_output) => Json(json!({
+                "status": "ok",
+                "message": "opearation was successful",
+                "kv_store_name": kv_store_name,
+                "operation_status": true,
+                "kv_output": {
+                    "key": kv_output.key,
+                    "value": kv_output.value
+                }
+            })),
+            None => Json(json!({
+                "status": "ok",
+                "message": "No such key exists in this KvStore",
+                "kv_store_name": kv_store_name,
+                "operation_status": false,
+                "kv_output": {
+                    "key": "",
+                    "value": ""
+                }
+            })),
+        },
+        None => Json(json!({
+            "status": "ok",
+            "message": "There ain't any such KvStore",
+            "kv_store_name": kv_store_name,
+            "operation_status": false,
+            "kv_output": {
+                "key": "",
+                "value": ""
+            }
+        })),
+    }
+}
 
-            match kv_store_guard.read(key) {
+#[axum::debug_handler]
+pub async fn delete_value(
+    State(app_state): State<Arc<AppState>>,
+    Path((kv_store_name, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    println!("/{kv_store_name}/delete/{key} CALLED");
+    let stores_map = app_state.get_stores_map_clone();
+
+    let kv_store = {
+        let stores_map_guard = stores_map.read().await;
+        stores_map_guard.get(&kv_store_name).clone()
+    };
+
+    match kv_store {
+        Some(kv_store) => match kv_store.delete(key).await {
+            Ok(something) => match something {
                 Some(kv_output) => Json(json!({
                     "status": "ok",
                     "message": "opearation was successful",
@@ -104,8 +163,19 @@ pub async fn read_value(
                         "value": ""
                     }
                 })),
-            }
-        }
+            },
+            Err(e) => Json(json!({
+                "status": "ok",
+                "message": "Failed to Delete, Try Again Later",
+                "kv_store_name": kv_store_name,
+                "operation_status": false,
+                "error": e,
+                "kv_output": {
+                    "key": "",
+                    "value": ""
+                }
+            })),
+        },
         None => Json(json!({
             "status": "ok",
             "message": "There ain't any such KvStore",
@@ -119,115 +189,55 @@ pub async fn read_value(
     }
 }
 
-pub async fn delete_value(
-    State(app_state): State<AppState>,
-    Path((kv_store_name, key)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let stores_map = app_state.get_stores_map_clone();
-
-    let stores_map_guard = stores_map.lock().unwrap();
-
-    match stores_map_guard.get(&kv_store_name) {
-        Some(kv_store) => {
-            let mut kv_store_guard = kv_store.lock().unwrap();
-
-            match kv_store_guard.delete(key) {
-                Ok(something) => match something {
-                    Some(kv_output) => Json(json!({
-                        "status": "ok",
-                        "message": "opearation was successful",
-                        "kv_store_name": kv_store_name,
-                        "operation_status": true,
-                        "kv_output": {
-                            "key": kv_output.key,
-                            "value": kv_output.value
-                        }
-                    })),
-                    None => Json(json!({
-                        "status": "ok",
-                        "message": "No such key exists in this KvStore",
-                        "kv_store_name": kv_store_name,
-                        "operation_status": false,
-                        "kv_output": {
-                            "key": "",
-                            "value": ""
-                        }
-                    })),
-                },
-                Err(e) => Json(json!({
-                    "status": "ok",
-                    "message": "Failed to Delete, Try Again Later",
-                    "kv_store_name": kv_store_name,
-                    "operation_status": false,
-                    "error": e,
-                    "kv_output": {
-                        "key": "",
-                        "value": ""
-                    }
-                })),
-            }
-        }
-        None => Json(json!({
-            "status": "ok",
-            "message": "There ain't any such KvStore",
-            "kv_store_name": kv_store_name,
-            "operation_status": false,
-            "kv_output": {
-                "key": "",
-                "value": ""
-            }
-        })),
-    }
-}
-
+#[axum::debug_handler]
 pub async fn write_value(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Form(payload): Form<NewKV>,
 ) -> impl IntoResponse {
+    println!("/write CALLED\nPayload: {:#?}", payload);
+
     let stores_map = app_state.get_stores_map_clone();
 
-    let stores_map_guard = stores_map.lock().unwrap();
-
-    match stores_map_guard.get(&payload.kv_store_name) {
-        Some(kv_store) => {
-            let mut kv_store_guard = kv_store.lock().unwrap();
-
-            match kv_store_guard.write(payload.key, payload.value) {
-                Ok(something) => match something {
-                    Some(kv_ouput) => Json(json!({
-                        "status": "ok",
-                        "message": "opearation was successful",
-                        "kv_store_name": payload.kv_store_name,
-                        "operation_status": true,
-                        "kv_output": {
-                            "key": kv_ouput.key,
-                            "value": kv_ouput.value
-                        }
-                    })),
-                    None => Json(json!({
-                        "status": "ok",
-                        "message": "Failed to Write, Try Again Later",
-                        "kv_store_name": payload.kv_store_name,
-                        "operation_status": false,
-                        "kv_output": {
-                            "key": "",
-                            "value": ""
-                        }
-                    })),
-                },
-                Err(e) => Json(json!({
+    let kv_store = {
+        let stores_map_guard = stores_map.read().await;
+        stores_map_guard.get(&payload.kv_store_name).clone()
+    };
+    match kv_store {
+        Some(kv_store) => match kv_store.write(payload.key, payload.value).await {
+            Ok(something) => match something {
+                Some(kv_ouput) => Json(json!({
+                    "status": "ok",
+                    "message": "opearation was successful",
+                    "kv_store_name": payload.kv_store_name,
+                    "operation_status": true,
+                    "kv_output": {
+                        "key": kv_ouput.key,
+                        "value": kv_ouput.value
+                    }
+                })),
+                None => Json(json!({
                     "status": "ok",
                     "message": "Failed to Write, Try Again Later",
                     "kv_store_name": payload.kv_store_name,
-                    "error": e,
                     "operation_status": false,
                     "kv_output": {
                         "key": "",
                         "value": ""
                     }
                 })),
-            }
-        }
+            },
+            Err(e) => Json(json!({
+                "status": "ok",
+                "message": "Failed to Write, Try Again Later",
+                "kv_store_name": payload.kv_store_name,
+                "error": e,
+                "operation_status": false,
+                "kv_output": {
+                    "key": "",
+                    "value": ""
+                }
+            })),
+        },
         None => Json(json!({
             "status": "ok",
             "message": "There ain't any such KvStore",
@@ -242,20 +252,21 @@ pub async fn write_value(
 }
 
 pub async fn fetch_full_kv_store(
-    State(app_state): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Path(kv_store_name): Path<String>,
 ) -> impl IntoResponse {
     let stores_map = app_state.get_stores_map_clone();
 
-    let stores_map_guard = stores_map.lock().unwrap();
+    let kv_store = {
+        let stores_map_guard = stores_map.read().await;
+        stores_map_guard.get(&kv_store_name).clone()
+    };
 
-    println!("{stores_map_guard:#?}");
+    println!("{kv_store:#?}");
 
-    match stores_map_guard.get(&kv_store_name) {
+    match kv_store {
         Some(kv_store) => {
-            let kv_store_guard = kv_store.lock().unwrap();
-
-            let kv_output = kv_store_guard.fetch_all();
+            let kv_output = kv_store.fetch_all().await;
 
             Json(json!({
                 "status": "ok",
@@ -264,7 +275,7 @@ pub async fn fetch_full_kv_store(
                 "operation_status": true,
                 "kv_output": kv_output
             }))
-        },
+        }
         None => Json(json!({
             "status": "ok",
             "message": "There ain't any such KvStore",

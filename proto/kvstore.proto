@@ -33,4 +33,9 @@ message WAL {
   AvailableOperationsOnKV operation = 2;
 }
 
-
+// Snapshot Record
+message Snapshot {
+    // Sequence number of the last operation performed on the mem_storage
+    uint64 last_sequence = 1;
+    map<string, string> data = 2;
+}

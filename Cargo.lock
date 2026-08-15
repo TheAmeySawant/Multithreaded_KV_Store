@@ -427,6 +427,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
