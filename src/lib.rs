@@ -36,11 +36,10 @@ use tokio::{
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/kvstore.rs"));
 }
-pub use proto::{DeleteKv, ReadKv, Wal, WriteKv, available_operations_on_kv::Op};
-
-use proto::AvailableOperationsOnKv;
-
-use crate::proto::Snapshot;
+pub use proto::{
+    AvailableOperationsOnKv, DeleteKv, ReadKv, Snapshot, Wal, WriteKv,
+    available_operations_on_kv::Op,
+};
 
 type TokioMutex<T> = tokio::sync::Mutex<T>;
 
@@ -236,52 +235,58 @@ impl WalRecord {
     /// for the first from_file() call, the cursor is on the start of the file, and reads the first WalRecord, if it exists.
     /// then for later from_file() call, the cursor is just after the latest WalRecord readed by itself, this call will read next WalRecord, if it exists.
     ///
-    ///
     /// ## Understanding how it works
+    ///----------------------------------------------------------
     ///
     /// **First call**
+    /// ```text
     ///
-    ///     +--------------------------------------------------+
     ///     
     ///     | R1 | R2 | R3 | R4 | R5 |
     ///     
     ///     ^
     ///     
     ///     Cursor
+    /// ```
     ///----------------------------------------------------------
+    ///
     /// **Second call**
-    ///     
-    ///     +--------------------------------------------------+
+    /// ```text
+    ///
     ///     
     ///     | R1 | R2 | R3 | R4 | R5 |
     ///     
     ///           ^
     ///     
     ///           Cursor
+    /// ```
     /// ----------------------------------------------------------
-    /// **Thrid call**
     ///
-    ///     +--------------------------------------------------+
+    /// **Third call**
+    /// ```text
     ///
     ///     | R1 | R2 | R3 | R4 | R5 |
     ///
     ///                ^
     ///
     ///                Cursor
-    ///
+    /// ```
     /// ----------------------------------------------------------
+    ///
     /// The cursor automatically advances, so that next call reads the next WalRecord, if it exists
     ///
-    /// ## Returns
-    /// *Ok(Some(WalRecord))* -> when WalRecord is encountered in wal.log file
+    /// Returns:
+    /// Ok(Some(WalRecord)) -> when WalRecord is encountered in wal.log file
     ///
-    ///         or
-    ///  
-    /// *Ok(None)* -> when EOF (End Of File) is encountered
+    /// ```text
+    ///        or
+    /// ```
+    /// Ok(None) -> when EOF (End Of File) is encountered
     ///
-    ///         or
-    ///
-    /// *Err(String)* -> when a Error is encountered
+    /// ```text
+    ///        or
+    /// ```
+    /// Err(String) -> when a Error is encountered
     fn from_file<R: Read>(reader: &mut R) -> Result<Option<Self>, String> {
         let mut length_buf = [0u8; 8];
 
@@ -582,8 +587,10 @@ impl SnapshotTracker {
 /// ```
 /// use multithreaded_kv_store::StoreEngine;
 ///
-/// let my_kv_store_engine = StoreEngine::connect("my_kv");
-///
+/// #[tokio::main]
+/// async fn main() {
+///     let store = StoreEngine::connect("doc_test_store", 65000).unwrap();
+/// }
 /// ```
 #[derive(Debug)]
 pub struct StoreEngine {
@@ -606,7 +613,12 @@ impl StoreEngine {
     ///
     /// # Example
     /// ```
-    /// let my_kv_store_engine = StoreEngine::connect("my_kv", 65000);
+    /// use multithreaded_kv_store::StoreEngine;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let store = StoreEngine::connect("doc_test_store", 65000).unwrap();
+    /// }
     /// ```
     pub fn connect(kv_store_name: &str, snapshot_window_size: u64) -> Result<Arc<Self>, String> {
         let wal_folder_path = format!("projects/{kv_store_name}/wal");
@@ -735,13 +747,9 @@ impl StoreEngine {
         return Ok(store_engine);
     }
 
+    /// Later on can be used for taking input from CLI
     /// *prepare_operation* returns an *AvailableOperationsOnKv* instance for the given *operation_query*.
     /// Returns Syntax Error if query is incorrect
-    /// ## Example
-    /// ```
-    /// use multithreaded_kv_store::StoreEngine;
-    /// let prepared_operation = StoreEngine::prepare_operation("Read Name").unwrap();
-    /// ```
     ///
     /// # RULES of operation_query
     ///
@@ -782,10 +790,7 @@ impl StoreEngine {
     ///
     /// i.e name, Name, NAme are not equal, therefore, 3 distinct keys
     ///
-    pub fn prepare_operation(
-        &self,
-        operation_query: &str,
-    ) -> Result<AvailableOperationsOnKv, String> {
+    fn _prepare_operation(&self, operation_query: &str) -> Result<AvailableOperationsOnKv, String> {
         // let operation_query_lowered = operation_query.to_lowercase();
         let query_list: Vec<&str> = operation_query.split(' ').collect();
 
@@ -830,22 +835,10 @@ impl StoreEngine {
         }
     }
 
+    /// Later on can be used to execute the ouptput from prepare_operation method
     /// ## execute_operation()
     /// Use execute_operation() to execute operation on a KvStore via StoreEngine
-    ///
-    /// ## Example
-    /// ```
-    /// use multithreaded_kv_store::StoreEngine;
-    ///
-    /// let my_kv_store_engine = StoreEngine::connect("my_kv", 65000);
-    ///
-    /// let operation = StoreEngine::prepare_operation("Read name").unwrap();
-    ///
-    /// let output = my_kv_store_engine.execute_operation(operation).unwrap();
-    ///
-    /// ```
-    ///
-    pub async fn execute_operation(
+    async fn _execute_operation(
         &self,
         mut operation: AvailableOperationsOnKv,
     ) -> Result<Option<KvOutput>, String> {
@@ -1084,7 +1077,10 @@ impl StoreEngine {
                 log_tracker_guard.wal_file = Some(truncated_wal_log_file);
             }
             Err(e) => {
-                return Err(get_err(format!("Failed to open wal.log in append-only mode\nwal_file_path: {}\n\nError: {e}", log_tracker_guard.wal_file_path)));
+                return Err(get_err(format!(
+                    "Failed to open wal.log in append-only mode\nwal_file_path: {}\n\nError: {e}",
+                    log_tracker_guard.wal_file_path
+                )));
             }
         }
 
@@ -1287,12 +1283,21 @@ impl Stores {
     }
 
     /// Inserts KvStore of *kv_store_name* in the StoresMap
-    /// ## Example
+    /// # Example
     /// ```
-    /// // Define StoresMap
-    /// let mut stores_map:StoresMap;
+    /// use std::sync::Arc;
+    /// use tokio::sync::RwLock;
+    /// use multithreaded_kv_store::{StoreEngine, Stores};
     ///
-    /// stores_map.insert("my_kv").await.unwrap();
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let store = StoreEngine::connect("doc_test_store", 65000).unwrap();
+    ///
+    ///     let stores_map = Arc::new(RwLock::new(Stores::new()));
+    ///
+    ///     let mut stores = stores_map.write().await;
+    ///     stores.insert("doc_test_store", store);
+    /// }
     /// ```
     pub fn insert(&mut self, kv_store_name: &str, store_engine: Arc<StoreEngine>) {
         // By default the snapshot_window_size is 65000 operations
@@ -1300,22 +1305,29 @@ impl Stores {
     }
 
     /// fetches the StoreEnigne of the given kv_store_name from the StoresMap
-    /// ## Example
+    /// # Example
     /// ```
-    /// // Fetch & use from Stores
-    /// let stores = stores_map.clone();
+    /// use std::sync::Arc;
+    /// use tokio::sync::RwLock;
+    /// use multithreaded_kv_store::{StoreEngine, Stores};
     ///
-    /// let fetch = move || {
-    ///     let stores = stores.lock().unwrap(); // <-- HashMap lock acquired here
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let store = StoreEngine::connect("doc_test_store", 65000).unwrap();
     ///
-    ///     stores.get("store1").clone() // returns the StoreEnigne's Arc pointer
-    /// }; // <-- HashMap lock released here
+    ///     let stores_map = Arc::new(RwLock::new(Stores::new()));
     ///
-    /// // Get lock of the StoreEnigne
-    /// let mut engine = fetch().lock().unwrap();
+    ///     {
+    ///         let mut stores = stores_map.write().await;
+    ///         stores.insert("doc_test_store", store);
+    ///     }
     ///
-    /// engine.execute_operation(...);
-    ///  
+    ///     let stores = stores_map.read().await;
+    ///
+    ///     let result = stores.get("doc_test_store");
+    ///
+    ///     assert!(result.is_some());
+    /// }
     /// ```
     pub fn get(&self, kv_store_name: &str) -> Option<Arc<StoreEngine>> {
         println!("{:#?}", self.inner);
@@ -1357,17 +1369,13 @@ impl Stores {
 /// ## get_err()
 /// allows you to print your custom message with the actual error given by the rust.
 ///
-/// ### Example
+/// # Example
 /// ```
-/// fn foo(wal: Wal) -> Result<Vec<u8>, String> {
+/// use multithreaded_kv_store::get_err;
 ///
-///     let mut buf = Vec::new();
-///     if let Err(e) = wal.encode(&mut buf) {
-///         return Err(get_err(format!(
-///             "Error Occured while encoding operation into 8bit buffer (vec<u8>)\n{e}"
-///         )));
-///     }
-/// }
+/// let error = get_err("Something went wrong".to_string());
+///
+/// assert_eq!(error, "Something went wrong");
 /// ```
 pub fn get_err(err: String) -> String {
     println!("{}", &err);
