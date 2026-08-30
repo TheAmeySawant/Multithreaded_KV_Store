@@ -2,8 +2,9 @@
 use prost::Message;
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions, create_dir_all},
+    fs::{self, File, OpenOptions, create_dir_all},
     io::{
+        Error,
         ErrorKind::{self, UnexpectedEof},
         Read, Write,
     },
@@ -12,7 +13,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
     vec,
 };
 
@@ -117,6 +118,114 @@ impl AppState {
         }
 
         Ok(())
+    }
+}
+
+impl AppState {
+    /// Test/application-facing façade for creating or reopening a store.
+    ///
+    /// Replaces the active StoreEngine for `kv_store_name` when one is already
+    /// present. This is useful for restart/recovery flows while keeping store
+    /// ownership inside AppState.
+    pub async fn connect_store(
+        &self,
+        kv_store_name: &str,
+        snapshot_window_size: u64,
+    ) -> Result<(), String> {
+        let store = StoreEngine::connect(kv_store_name, snapshot_window_size)?;
+        self.stores_map.write().await.insert(kv_store_name, store);
+        Ok(())
+    }
+
+    pub async fn store_exists(&self, kv_store_name: &str) -> bool {
+        self.stores_map.read().await.get(kv_store_name).is_some()
+    }
+
+    pub async fn read_store(
+        &self,
+        kv_store_name: &str,
+        key: String,
+    ) -> Result<Option<KvOutput>, String> {
+        let store = self
+            .stores_map
+            .read()
+            .await
+            .get(kv_store_name)
+            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+
+        Ok(store.read(key).await)
+    }
+
+    pub async fn write_store(
+        &self,
+        kv_store_name: &str,
+        key: String,
+        value: String,
+    ) -> Result<Option<KvOutput>, String> {
+        let store = self
+            .stores_map
+            .read()
+            .await
+            .get(kv_store_name)
+            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+
+        store.write(key, value).await
+    }
+
+    pub async fn delete_key(
+        &self,
+        kv_store_name: &str,
+        key: String,
+    ) -> Result<Option<KvOutput>, String> {
+        let store = self
+            .stores_map
+            .read()
+            .await
+            .get(kv_store_name)
+            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+
+        store.delete(key).await
+    }
+
+    pub async fn fetch_all_store(
+        &self,
+        kv_store_name: &str,
+    ) -> Result<HashMap<String, String>, String> {
+        let store = self
+            .stores_map
+            .read()
+            .await
+            .get(kv_store_name)
+            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+
+        Ok(store.fetch_all().await)
+    }
+
+    /// Execute the textual operation path while keeping the test/API entry
+    /// point at AppState.
+    pub async fn execute_query(
+        &self,
+        kv_store_name: &str,
+        operation_query: &str,
+    ) -> Result<Option<KvOutput>, String> {
+        let store = self
+            .stores_map
+            .read()
+            .await
+            .get(kv_store_name)
+            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+
+        let operation = store._prepare_operation(operation_query)?;
+        store._execute_operation(operation).await
+    }
+
+    pub async fn delete_store(&self, kv_store_name: &str) -> Result<bool, String> {
+        let mut stores_map_guard = self.stores_map.write().await;
+        stores_map_guard.delete_store(kv_store_name).await
+    }
+
+    pub async fn cleanup_deleted_folder(&self) {
+        self.stores_map.read().await.deleted_folder_cleanup().await;
     }
 }
 
@@ -518,6 +627,7 @@ struct SnapshotTracker {
     window_size: u64,
     next_seq: AtomicU64,
     due: AtomicBool,
+    shutdown: AtomicBool,
 }
 
 impl SnapshotTracker {
@@ -528,6 +638,7 @@ impl SnapshotTracker {
             window_size,
             next_seq: AtomicU64::new(next_seq_no + window_size),
             due: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -544,7 +655,15 @@ impl SnapshotTracker {
 
                     let snapshot_tracker = &strong_store_engine.snapshot_tracker;
 
+                    if snapshot_tracker.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+
                     let _gate = snapshot_tracker.gate.write().await;
+
+                    if snapshot_tracker.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     if let Err(e) = strong_store_engine.write_and_save_snapshot().await {
                         eprintln!("{e}");
@@ -950,7 +1069,7 @@ impl StoreEngine {
             if result == 0 {
                 return Err(get_err(format!(
                     "\nError occured while renaming file\n\nError: {}",
-                    std::io::Error::last_os_error()
+                    Error::last_os_error()
                 )));
             }
 
@@ -959,21 +1078,44 @@ impl StoreEngine {
 
         #[cfg(unix)]
         {
-            fs::rename(src, dst)?;
+            let src_str = src.to_str().unwrap();
+            let dst_str = dst.to_str().unwrap();
+
+            if let Err(e) = fs::rename(src, dst) {
+                return Err(get_err(format!(
+                    "Failed to replace the snapshot of {} store\n\nsrc: {}\ndst: {}\n\nError: {e}",
+                    self.kv_store_name, src_str, dst_str
+                )));
+            };
+
+            let parent_path = match src.parent() {
+                Some(path) => path,
+                None => {
+                    return Err(get_err(format!(
+                        "There is no Parent directory of {} snapshot of {} store.\nThere should be a parent directory of {} snapshot, inorder to sync it",
+                        src_str, self.kv_store_name, src_str
+                    )));
+                }
+            };
 
             // Make the directory entry update durable.
-            let dir = fs::File::open(src.parent().ok_or_else(|| {
-                let io_error = io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "source path has no parent directory",
-                );
+            let dir = match fs::File::open(parent_path) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return Err(get_err(format!(
+                        "Failed to open the {} parent directory of {} store\n\nError: {e}",
+                        parent_path.to_str().unwrap(),
+                        self.kv_store_name
+                    )));
+                }
+            };
 
+            if let Err(e) = dir.sync_all() {
                 return Err(get_err(format!(
-                    "Error occured while fetching the parent directory\n\nError: {io_error}"
+                    "Failde to sync the snapshot repalcement of {} store\n\nError: {e}",
+                    self.kv_store_name
                 )));
-            })?)?;
-
-            dir.sync_all()?;
+            }
 
             Ok(())
         }
@@ -1035,6 +1177,25 @@ impl StoreEngine {
         Ok(())
     }
 
+    fn rename_snapshot_to_save_it(&self) -> Result<(), String> {
+        let snapshot_folder_path = format!("projects/{}/snapshot", self.kv_store_name);
+
+        let temp_snapshot_file_path = snapshot_folder_path.clone() + "/snapshot.tmp";
+
+        let real_snapshot_file_path = snapshot_folder_path.clone() + "/snapshot.bin";
+
+        if let Err(e) = self.durable_snapshot_rename(
+            Path::new(&temp_snapshot_file_path),
+            Path::new(&real_snapshot_file_path),
+        ) {
+            return Err(get_err(format!(
+                "Failed to rename snapshot.tmp to snapshot.bin\n\ntemp_snapshot_file_path: {temp_snapshot_file_path}\nreal_snapshot_file_path: {real_snapshot_file_path}\n\nError: {e}"
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn truncate_wal_log(&self) -> Result<(), String> {
         let mut log_tracker_guard = self.log_tracker.lock().await;
 
@@ -1064,6 +1225,7 @@ impl StoreEngine {
             )));
         }
 
+        // drop it again to open it in append mode
         drop(truncated_wal_log_file);
 
         match File::options()
@@ -1102,25 +1264,6 @@ impl StoreEngine {
         Ok(())
     }
 
-    fn rename_snapshot_to_save_it(&self) -> Result<(), String> {
-        let snapshot_folder_path = format!("projects/{}/snapshot", self.kv_store_name);
-
-        let temp_snapshot_file_path = snapshot_folder_path.clone() + "/snapshot.tmp";
-
-        let real_snapshot_file_path = snapshot_folder_path.clone() + "/snapshot.bin";
-
-        if let Err(e) = self.durable_snapshot_rename(
-            Path::new(&temp_snapshot_file_path),
-            Path::new(&real_snapshot_file_path),
-        ) {
-            return Err(get_err(format!(
-                "Failed to rename snapshot.tmp to snapshot.bin\n\ntemp_snapshot_file_path: {temp_snapshot_file_path}\nreal_snapshot_file_path: {real_snapshot_file_path}\n\nError: {e}"
-            )));
-        }
-
-        Ok(())
-    }
-
     /// writes the in_memory_storage into the snapshot.bin atomically
     pub async fn write_and_save_snapshot(&self) -> Result<(), String> {
         self.create_and_write_snapshot_temp().await?;
@@ -1134,6 +1277,191 @@ impl StoreEngine {
     pub async fn graceful_shutdown(&self) -> Result<(), String> {
         let _gate = self.snapshot_tracker.gate.write().await;
         self.write_and_save_snapshot().await
+    }
+
+    /// Atomically and Durably this move the store directory from 'projects' folder to 'deleted' folder with unique name
+    ///
+    /// **Source**:
+    ///
+    /// projects/<store_name>
+    ///
+    /// **Destination**:
+    ///
+    /// deleted/<store_name>-HH-MM-SS-microseconds
+    fn move_store_to_deleted(&self) -> Result<(), String> {
+        // ---------------------------------------------------------
+        // Generate HH-MM-SS-micros from today's midnight.
+        // ---------------------------------------------------------
+
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(now) => now,
+            Err(e) => return Err(get_err(format!("Failed to get current system time: {e}"))),
+        };
+
+        let seconds_today = now.as_secs() % 86_400;
+        let hours = seconds_today / 3_600;
+        let minutes = (seconds_today % 3_600) / 60;
+        let seconds = seconds_today % 60;
+        let micros = now.subsec_micros();
+
+        // ---------------------------------------------------------
+        // Source:
+        //
+        // projects/<store_name>
+        //
+        // Destination:
+        //
+        // deleted/<store_name>-HH-MM-SS-microseconds
+        // ---------------------------------------------------------
+
+        let src = format!("projects/{}", self.kv_store_name);
+
+        let dst = format!(
+            "deleted/{}-{:02}-{:02}-{:02}-{:06}",
+            self.kv_store_name, hours, minutes, seconds, micros
+        );
+
+        let src_path = Path::new(&src);
+        let dst_path = Path::new(&dst);
+
+        // ---------------------------------------------------------
+        // Windows
+        // ---------------------------------------------------------
+
+        #[cfg(windows)]
+        {
+            let src_wide: Vec<u16> = src_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let dst_wide: Vec<u16> = dst_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let result = unsafe {
+                MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), MOVEFILE_WRITE_THROUGH)
+            };
+
+            if result == 0 {
+                return Err(get_err(format!(
+                    "Failed to move the {} store from projects folder to deleted folder\nsrc: {}\ndst: {}\n\n Last OS Error: {}",
+                    self.kv_store_name,
+                    src_path.to_str().unwrap(),
+                    dst_path.to_str().unwrap(),
+                    Error::last_os_error()
+                )));
+            }
+
+            return Ok(());
+        }
+
+        // ---------------------------------------------------------
+        // Linux / Unix
+        // ---------------------------------------------------------
+
+        #[cfg(unix)]
+        {
+            if let Err(e) = fs::rename(src_path, dst_path) {
+                return Err(get_err(format!(
+                    "Failed to move the {} store from projcet folder to deleted folder\n\nSource Path: {}\nDestination Path: {}\n\nError: {e} ",
+                    self.kv_store_name,
+                    src_path.to_str().unwrap(),
+                    dst_path.to_str().unwrap()
+                )));
+            }
+
+            // Make the directory-entry change durable.
+            // Projects folder takes priority in syncing
+            // Therefore we sync the src first
+            let parent_src = match src_path.parent() {
+                Some(dst) => dst,
+                None => {
+                    return Err(get_err(format!(
+                        "There is no parent of the {} store, There has to be a parent of the {} store",
+                        self.kv_store_name, self.kv_store_name
+                    )));
+                }
+            };
+
+            let projects_dir = match File::open(parent_src) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return Err(get_err(format!(
+                        "Failed to open the store's parent directory\n\nParent Directory Path: {}\n\nError: {e}",
+                        parent_src.to_str().unwrap()
+                    )));
+                }
+            };
+
+            if let Err(e) = projects_dir.sync_all() {
+                return Err(get_err(format!(
+                    "Failed to sync the move of the store's directory from project folder to deleted folder\n\nError: {e}"
+                )));
+            }
+
+            // Make the deleted directory-entry change durable.
+            let parent_dst = match dst_path.parent() {
+                Some(dst) => dst,
+                None => {
+                    return Err(get_err(format!(
+                        "There is no parent of the {} store, There has to be a parent of the {} store",
+                        self.kv_store_name, self.kv_store_name
+                    )));
+                }
+            };
+
+            let deleted_dir = match File::open(parent_dst) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return Err(get_err(format!(
+                        "Failed to open the store's parent directory\n\nParent Directory Path: {}\n\nError: {e}",
+                        parent_dst.to_str().unwrap()
+                    )));
+                }
+            };
+
+            if let Err(e) = deleted_dir.sync_all() {
+                return Err(get_err(format!(
+                    "Failed to sync the move of the store's directory from project folder to deleted folder\n\nError: {e}"
+                )));
+            }
+
+            Ok(())
+        }
+    }
+
+    async fn delete_store(&self) -> Result<(), String> {
+        // Notify and shutdown the snapshot tracker task
+        self.snapshot_tracker
+            .shutdown
+            .store(true, Ordering::Release);
+
+        self.snapshot_tracker.notification.notify_waiters();
+
+        let _gate = self.snapshot_tracker.gate.write().await;
+
+        let mut log_tracker_guard = self.log_tracker.lock().await;
+
+        // remove and drop wal_file's instance from log_tracker
+        drop(log_tracker_guard.wal_file.take());
+
+        if let Err(e) = fs::create_dir("deleted") {
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(get_err(format!(
+                    "Failed to make sure that 'deleted' folder exists/created"
+                )));
+            }
+        }
+
+        println!("'deleted' directory created");
+
+        self.move_store_to_deleted()?;
+
+        Ok(())
     }
 
     /// ## Returns
@@ -1269,6 +1597,7 @@ impl StoreEngine {
 #[derive(Debug)]
 pub struct Stores {
     inner: HashMap<String, Arc<StoreEngine>>,
+    lock_for_store_deletion: TokioMutex<()>,
 }
 
 /// A HashMap of currently active StoreEngines
@@ -1279,6 +1608,7 @@ impl Stores {
     pub fn new() -> Stores {
         Stores {
             inner: HashMap::new(),
+            lock_for_store_deletion: TokioMutex::new(()),
         }
     }
 
@@ -1363,6 +1693,45 @@ impl Stores {
         }
 
         Ok(())
+    }
+
+    pub async fn delete_store(&mut self, kv_store_name: &str) -> Result<bool, String> {
+        let _deletion_lock = self.lock_for_store_deletion.lock().await;
+
+        let kv_store = match self.get(kv_store_name) {
+            Some(store) => store,
+            None => {
+                return Ok(false);
+            }
+        };
+
+        kv_store.delete_store().await?;
+
+        self.inner.remove(kv_store_name);
+
+        Ok(true)
+    }
+
+    pub async fn spawn_deleted_folder_cleaner(&self) {
+        let mut time_interval = interval(Duration::from_mins(10));
+
+        loop {
+            time_interval.tick().await;
+
+            self.deleted_folder_cleanup().await;
+        }
+    }
+
+    pub async fn deleted_folder_cleanup(&self) {
+        let _deletion_lock = self.lock_for_store_deletion.lock().await;
+
+        let deleted_dir = Path::new("deleted");
+
+        if deleted_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(deleted_dir) {
+                eprintln!("Failed to clean up 'deleted' folder\nError: {e}");
+            }
+        }
     }
 }
 
