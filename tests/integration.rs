@@ -4,6 +4,9 @@ mod common;
 #[path = "integration/operations.rs"]
 mod operations;
 
+#[path = "integration/pagination.rs"]
+mod pagination;
+
 #[path = "integration/concurrency.rs"]
 mod concurrency;
 

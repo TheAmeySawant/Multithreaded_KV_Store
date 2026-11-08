@@ -1,5 +1,5 @@
 use crate::common::{
-    app_state, cleanup_store, create_store, serial_guard, unique_store_name,
+    app_state, cleanup_store, create_store, fetch_all, serial_guard, unique_store_name,
 };
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn write_read_and_update_existing_key() {
     create_store(&state, &name, 1_000_000).await.unwrap();
 
     let first = state
-        .write_store(&name, "name".into(), "Amey".into())
+        .write_in_store(&name, "name".into(), "Amey".into())
         .await
         .unwrap()
         .unwrap();
@@ -20,7 +20,7 @@ async fn write_read_and_update_existing_key() {
     assert_eq!(first.value, "Amey");
 
     let read = state
-        .read_store(&name, "name".into())
+        .read_from_store(&name, "name".into())
         .await
         .unwrap()
         .unwrap();
@@ -28,7 +28,7 @@ async fn write_read_and_update_existing_key() {
     assert_eq!(read.value, "Amey");
 
     let updated = state
-        .write_store(&name, "name".into(), "Sawant".into())
+        .write_in_store(&name, "name".into(), "Sawant".into())
         .await
         .unwrap()
         .unwrap();
@@ -36,7 +36,7 @@ async fn write_read_and_update_existing_key() {
     assert_eq!(updated.value, "Sawant");
 
     let read = state
-        .read_store(&name, "name".into())
+        .read_from_store(&name, "name".into())
         .await
         .unwrap()
         .unwrap();
@@ -55,12 +55,12 @@ async fn delete_existing_and_non_existing_keys() {
     create_store(&state, &name, 1_000_000).await.unwrap();
 
     state
-        .write_store(&name, "k".into(), "v".into())
+        .write_in_store(&name, "k".into(), "v".into())
         .await
         .unwrap();
 
     let deleted = state
-        .delete_key(&name, "k".into())
+        .delete_from_store(&name, "k".into())
         .await
         .unwrap()
         .unwrap();
@@ -70,7 +70,7 @@ async fn delete_existing_and_non_existing_keys() {
 
     assert!(
         state
-            .read_store(&name, "k".into())
+            .read_from_store(&name, "k".into())
             .await
             .unwrap()
             .is_none()
@@ -78,7 +78,7 @@ async fn delete_existing_and_non_existing_keys() {
 
     assert!(
         state
-            .delete_key(&name, "k".into())
+            .delete_from_store(&name, "k".into())
             .await
             .unwrap()
             .is_none()
@@ -88,7 +88,7 @@ async fn delete_existing_and_non_existing_keys() {
 }
 
 #[tokio::test]
-async fn fetch_all_returns_complete_current_state() {
+async fn paged_fetch_returns_complete_current_state() {
     let _guard = serial_guard().await;
     let state = app_state();
     let name = unique_store_name("fetch_all");
@@ -97,14 +97,17 @@ async fn fetch_all_returns_complete_current_state() {
 
     for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
         state
-            .write_store(&name, key.into(), value.into())
+            .write_in_store(&name, key.into(), value.into())
             .await
             .unwrap();
     }
 
-    state.delete_key(&name, "b".into()).await.unwrap();
+    state
+        .delete_from_store(&name, "b".into())
+        .await
+        .unwrap();
 
-    let all = state.fetch_all_store(&name).await.unwrap();
+    let all = fetch_all(&state, &name).await;
 
     assert_eq!(all.len(), 2);
     assert_eq!(all.get("a"), Some(&"1".to_string()));
@@ -123,18 +126,18 @@ async fn keys_and_values_are_case_sensitive() {
     create_store(&state, &name, 1_000_000).await.unwrap();
 
     state
-        .write_store(&name, "name".into(), "Amey".into())
+        .write_in_store(&name, "name".into(), "Amey".into())
         .await
         .unwrap();
 
     state
-        .write_store(&name, "Name".into(), "SAWANT".into())
+        .write_in_store(&name, "Name".into(), "SAWANT".into())
         .await
         .unwrap();
 
     assert_eq!(
         state
-            .read_store(&name, "name".into())
+            .read_from_store(&name, "name".into())
             .await
             .unwrap()
             .unwrap()
@@ -144,7 +147,7 @@ async fn keys_and_values_are_case_sensitive() {
 
     assert_eq!(
         state
-            .read_store(&name, "Name".into())
+            .read_from_store(&name, "Name".into())
             .await
             .unwrap()
             .unwrap()
@@ -153,6 +156,43 @@ async fn keys_and_values_are_case_sensitive() {
     );
 
     cleanup_store(&state, &name).await;
+}
+
+#[tokio::test]
+async fn operations_on_a_missing_store_return_errors() {
+    let _guard = serial_guard().await;
+    let state = app_state();
+    let name = unique_store_name("missing_ops");
+
+    assert!(
+        state
+            .read_from_store(&name, "k".into())
+            .await
+            .is_err()
+    );
+
+    assert!(
+        state
+            .write_in_store(&name, "k".into(), "v".into())
+            .await
+            .is_err()
+    );
+
+    assert!(
+        state
+            .delete_from_store(&name, "k".into())
+            .await
+            .is_err()
+    );
+
+    assert!(state.execute_query(&name, "Read k").await.is_err());
+
+    assert!(
+        state
+            .fetch_page_from_store(&name, 0, 10)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

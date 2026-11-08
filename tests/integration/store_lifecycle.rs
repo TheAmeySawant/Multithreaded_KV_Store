@@ -37,12 +37,12 @@ async fn deleting_one_store_does_not_affect_another() {
         .unwrap();
 
     state
-        .write_store(&name_a, "key".into(), "A".into())
+        .write_in_store(&name_a, "key".into(), "A".into())
         .await
         .unwrap();
 
     state
-        .write_store(&name_b, "key".into(), "B".into())
+        .write_in_store(&name_b, "key".into(), "B".into())
         .await
         .unwrap();
 
@@ -53,7 +53,7 @@ async fn deleting_one_store_does_not_affect_another() {
 
     assert_eq!(
         state
-            .read_store(&name_b, "key".into())
+            .read_from_store(&name_b, "key".into())
             .await
             .unwrap()
             .unwrap()
@@ -87,7 +87,7 @@ async fn delete_moves_store_directory_out_of_projects() {
         .unwrap();
 
     state
-        .write_store(&name, "key".into(), "value".into())
+        .write_in_store(&name, "key".into(), "value".into())
         .await
         .unwrap();
 
@@ -117,6 +117,47 @@ async fn delete_moves_store_directory_out_of_projects() {
 }
 
 #[tokio::test]
+async fn deleted_store_can_no_longer_be_read_written_or_paged() {
+    let _guard = serial_guard().await;
+    let state = app_state();
+    let name = unique_store_name("delete_then_use");
+
+    create_store(&state, &name, 1_000_000)
+        .await
+        .unwrap();
+
+    state
+        .write_in_store(&name, "key".into(), "value".into())
+        .await
+        .unwrap();
+
+    assert!(state.delete_store(&name).await.unwrap());
+
+    assert!(
+        state
+            .read_from_store(&name, "key".into())
+            .await
+            .is_err()
+    );
+
+    assert!(
+        state
+            .write_in_store(&name, "key".into(), "value".into())
+            .await
+            .is_err()
+    );
+
+    assert!(
+        state
+            .fetch_page_from_store(&name, 0, 10)
+            .await
+            .is_err()
+    );
+
+    state.cleanup_deleted_folder().await;
+}
+
+#[tokio::test]
 async fn graceful_shutdown_persists_all_active_stores() {
     let _guard = serial_guard().await;
     let state = app_state();
@@ -133,12 +174,12 @@ async fn graceful_shutdown_persists_all_active_stores() {
         .unwrap();
 
     state
-        .write_store(&name_a, "k".into(), "A".into())
+        .write_in_store(&name_a, "k".into(), "A".into())
         .await
         .unwrap();
 
     state
-        .write_store(&name_b, "k".into(), "B".into())
+        .write_in_store(&name_b, "k".into(), "B".into())
         .await
         .unwrap();
 
@@ -156,7 +197,7 @@ async fn graceful_shutdown_persists_all_active_stores() {
 
     assert_eq!(
         state
-            .read_store(&name_a, "k".into())
+            .read_from_store(&name_a, "k".into())
             .await
             .unwrap()
             .unwrap()
@@ -166,7 +207,7 @@ async fn graceful_shutdown_persists_all_active_stores() {
 
     assert_eq!(
         state
-            .read_store(&name_b, "k".into())
+            .read_from_store(&name_b, "k".into())
             .await
             .unwrap()
             .unwrap()

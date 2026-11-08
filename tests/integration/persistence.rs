@@ -1,5 +1,6 @@
 use crate::common::{
-    app_state, cleanup_store, create_store, serial_guard, unique_store_name,
+    app_state, cleanup_store, create_store, expected_map, fetch_all, fetch_all_paged, seed_store,
+    serial_guard, unique_store_name,
 };
 use std::{fs, path::Path};
 
@@ -22,16 +23,19 @@ async fn restart_recovers_latest_state_from_wal() {
         .unwrap();
 
     state
-        .write_store(&name, "a".into(), "1".into())
+        .write_in_store(&name, "a".into(), "1".into())
         .await
         .unwrap();
 
     state
-        .write_store(&name, "b".into(), "2".into())
+        .write_in_store(&name, "b".into(), "2".into())
         .await
         .unwrap();
 
-    state.delete_key(&name, "a".into()).await.unwrap();
+    state
+        .delete_from_store(&name, "a".into())
+        .await
+        .unwrap();
 
     // Reconnect through AppState. Since the snapshot window is huge,
     // recovery should occur from WAL.
@@ -42,7 +46,7 @@ async fn restart_recovers_latest_state_from_wal() {
 
     assert!(
         state
-            .read_store(&name, "a".into())
+            .read_from_store(&name, "a".into())
             .await
             .unwrap()
             .is_none()
@@ -50,13 +54,55 @@ async fn restart_recovers_latest_state_from_wal() {
 
     assert_eq!(
         state
-            .read_store(&name, "b".into())
+            .read_from_store(&name, "b".into())
             .await
             .unwrap()
             .unwrap()
             .value,
         "2"
     );
+
+    cleanup_store(&state, &name).await;
+}
+
+#[tokio::test]
+async fn writes_after_recovery_are_recovered_again() {
+    let _guard = serial_guard().await;
+    let state = app_state();
+    let name = unique_store_name("wal_recovery_twice");
+
+    create_store(&state, &name, 1_000_000)
+        .await
+        .unwrap();
+
+    state
+        .write_in_store(&name, "a".into(), "1".into())
+        .await
+        .unwrap();
+
+    // First recovery
+    state
+        .connect_store(&name, 1_000_000)
+        .await
+        .unwrap();
+
+    // The sequence number must continue after recovery
+    state
+        .write_in_store(&name, "b".into(), "2".into())
+        .await
+        .unwrap();
+
+    // Second recovery
+    state
+        .connect_store(&name, 1_000_000)
+        .await
+        .unwrap();
+
+    let all = fetch_all(&state, &name).await;
+
+    assert_eq!(all.len(), 2);
+    assert_eq!(all.get("a"), Some(&"1".to_string()));
+    assert_eq!(all.get("b"), Some(&"2".to_string()));
 
     cleanup_store(&state, &name).await;
 }
@@ -72,12 +118,12 @@ async fn graceful_shutdown_creates_snapshot_and_truncates_wal() {
         .unwrap();
 
     state
-        .write_store(&name, "a".into(), "1".into())
+        .write_in_store(&name, "a".into(), "1".into())
         .await
         .unwrap();
 
     state
-        .write_store(&name, "b".into(), "2".into())
+        .write_in_store(&name, "b".into(), "2".into())
         .await
         .unwrap();
 
@@ -91,7 +137,7 @@ async fn graceful_shutdown_creates_snapshot_and_truncates_wal() {
         .await
         .unwrap();
 
-    let all = state.fetch_all_store(&name).await.unwrap();
+    let all = fetch_all(&state, &name).await;
 
     assert_eq!(all.get("a"), Some(&"1".to_string()));
     assert_eq!(all.get("b"), Some(&"2".to_string()));
@@ -110,7 +156,7 @@ async fn wal_crc_corruption_is_rejected_during_recovery() {
         .unwrap();
 
     state
-        .write_store(&name, "key".into(), "value".into())
+        .write_in_store(&name, "key".into(), "value".into())
         .await
         .unwrap();
 
@@ -143,12 +189,7 @@ async fn snapshot_recovery_works_with_empty_wal() {
         .await
         .unwrap();
 
-    for i in 0..10 {
-        state
-            .write_store(&name, format!("k{i}"), format!("v{i}"))
-            .await
-            .unwrap();
-    }
+    seed_store(&state, &name, 10).await;
 
     state.graceful_shutdown().await.unwrap();
 
@@ -160,13 +201,43 @@ async fn snapshot_recovery_works_with_empty_wal() {
         .await
         .unwrap();
 
-    let all = state.fetch_all_store(&name).await.unwrap();
+    let all = fetch_all(&state, &name).await;
 
-    let expected: std::collections::HashMap<_, _> = (0..10)
-        .map(|i| (format!("k{i}"), format!("v{i}")))
-        .collect();
+    assert_eq!(all, expected_map(10));
 
-    assert_eq!(all, expected);
+    cleanup_store(&state, &name).await;
+}
+
+#[tokio::test]
+async fn paged_fetch_after_recovery_covers_multiple_pages() {
+    let _guard = serial_guard().await;
+    let state = app_state();
+    let name = unique_store_name("recovery_pages");
+
+    create_store(&state, &name, 1_000_000)
+        .await
+        .unwrap();
+
+    // 150 entries = more than one maximum-size page (100)
+    seed_store(&state, &name, 150).await;
+
+    state.graceful_shutdown().await.unwrap();
+
+    state
+        .connect_store(&name, 1_000_000)
+        .await
+        .unwrap();
+
+    let (first, total) = state
+        .fetch_page_from_store(&name, 0, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(total, 150);
+    assert_eq!(first.len(), 100);
+
+    let all = fetch_all_paged(&state, &name, 40).await;
+    assert_eq!(all, expected_map(150));
 
     cleanup_store(&state, &name).await;
 }

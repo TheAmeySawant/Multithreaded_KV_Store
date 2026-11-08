@@ -14,5 +14,6 @@ pub fn create_app() -> Router<Arc<AppState>> {
         .route("/{kv_store_name}/read/{key}", get(read_value))
         .route("/{kv_store_name}/delete/{key}", get(delete_value))
         .route("/write", post(write_value))
-        .route("/full/{kv_store_name}", get(fetch_full_kv_store))
+        .route("/pages/{kv_store_name}", get(fetch_initial_page_from_kv_store))
+        .route("/pages/{kv_store_name}/{offset}/{limit}", get(fetch_page_kv_store))
 }

@@ -105,6 +105,7 @@ impl AppState {
     }
 
     pub async fn graceful_shutdown(&self) -> Result<(), String> {
+        // Make sure spawn method is uncommented in the api/mod.rs
         self.stop_access_tracker();
 
         let stores = {
@@ -122,7 +123,7 @@ impl AppState {
 }
 
 impl AppState {
-    /// Test/application-facing façade for creating or reopening a store.
+    /// Test/application-facing facade for creating or reopening a store.
     ///
     /// Replaces the active StoreEngine for `kv_store_name` when one is already
     /// present. This is useful for restart/recovery flows while keeping store
@@ -141,7 +142,7 @@ impl AppState {
         self.stores_map.read().await.get(kv_store_name).is_some()
     }
 
-    pub async fn read_store(
+    pub async fn read_from_store(
         &self,
         kv_store_name: &str,
         key: String,
@@ -156,7 +157,7 @@ impl AppState {
         Ok(store.read(key).await)
     }
 
-    pub async fn write_store(
+    pub async fn write_in_store(
         &self,
         kv_store_name: &str,
         key: String,
@@ -172,7 +173,7 @@ impl AppState {
         store.write(key, value).await
     }
 
-    pub async fn delete_key(
+    pub async fn delete_from_store(
         &self,
         kv_store_name: &str,
         key: String,
@@ -187,18 +188,34 @@ impl AppState {
         store.delete(key).await
     }
 
-    pub async fn fetch_all_store(
+    /// Fetch page of custom size
+    ///
+    /// Constraints:-
+    /// 1. offset cannot be negative
+    /// 2. limit is count of kvs to fecth from offset and limit has to be within 1 to 100 
+    pub async fn fetch_page_from_store(
         &self,
         kv_store_name: &str,
-    ) -> Result<HashMap<String, String>, String> {
-        let store = self
-            .stores_map
-            .read()
-            .await
-            .get(kv_store_name)
-            .ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?;
+        offset: usize,
+        limit: usize,
+    ) -> Result<(HashMap<String, String>, usize), String> {
 
-        Ok(store.fetch_all().await)
+
+        // limit Validation
+        if limit < 1 || limit > 100 {
+            return Err(get_err(format!(
+                "Invalid limit, limit has to be between 1 to 100"
+            )));
+        }
+
+        // fetch store
+        let store= {
+            let stores_map_guard = self.stores_map.read().await;
+            stores_map_guard.get(&kv_store_name).clone().ok_or_else(|| get_err(format!("Store '{kv_store_name}' not found")))?
+        };
+
+        // fetch page
+        Ok(store.fetch_page(offset, limit).await)
     }
 
     /// Execute the textual operation path while keeping the test/API entry
@@ -281,8 +298,16 @@ impl MemStorage {
         }
     }
 
-    fn fetch_all(&self) -> HashMap<String, String> {
-        self.mem_storage.clone()
+    fn fetch_page(&self, offset: usize, limit: usize) -> (HashMap<String, String>, usize) {
+        let page = self
+            .mem_storage
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        (page, self.mem_storage.len())
     }
 }
 
@@ -728,7 +753,7 @@ impl StoreEngine {
     /// connect() associative function connects to instance of StoreEngine for the given 'kv_store_name'
     /// project is part of Store
     ///
-    /// **snapshot_window_size**: After how many operations should snapshot trigger, it doesn't mean that exactly only that amount of operations will be saved in the snapshot, as it will only trigger the snapshot but still wait for ongoing operations to complete and then create new snapshot
+    /// **snapshot_window_size**: After how many operations should snapshot trigger, it doesn't mean that exactly only that amount of operations will be saved in the snapshot, as it only triggers the snapshot, waiting for ongoing operations to complete and then creating a new snapshot
     ///
     /// # Example
     /// ```
@@ -1545,9 +1570,13 @@ impl StoreEngine {
         }
     }
 
-    pub async fn fetch_all(&self) -> HashMap<String, String> {
+    pub async fn fetch_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> (HashMap<String, String>, usize) {
         let in_memory_storage_read_guard = self.in_memory_storage.read().await;
-        in_memory_storage_read_guard.fetch_all()
+        in_memory_storage_read_guard.fetch_page(offset, limit)
     }
 
     async fn record_on_wal_log(
@@ -1672,12 +1701,11 @@ impl Stores {
         self.inner.retain(|_, store_engine| {
             let mut access_tracker = store_engine.access_tracker.lock().unwrap();
 
+            access_tracker.intervals_count += 1;
+
             if access_tracker.current_access_count != 0 {
-                access_tracker.avg_access_per_minute += (access_tracker.current_access_count
-                    - access_tracker.avg_access_per_minute)
-                    / access_tracker.intervals_count;
+                access_tracker.avg_access_per_minute = access_tracker.avg_access_per_minute + (access_tracker.current_access_count - access_tracker.avg_access_per_minute) / access_tracker.intervals_count;
                 access_tracker.current_access_count = 0;
-                access_tracker.intervals_count += 1;
                 true
             } else {
                 false

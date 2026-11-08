@@ -19,7 +19,8 @@ pub async fn start_axum_tcp_server(addr: &str,app_state: Arc<AppState>, access_t
         .expect("failed to bind tcp listener");
 
     // here, None means default time will be used
-    app_state.spawn_access_tracker(access_tracker_interval_in_seconds);
+    app_state.spawn_access_tracker(access_tracker_interval_in_seconds); 
+    //When turning this ON, make sure to uncommment the shutdown method in graceful shutdown
 
     let app = create_app().with_state(Arc::clone(&app_state));
 

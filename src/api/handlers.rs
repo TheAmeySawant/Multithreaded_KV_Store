@@ -3,9 +3,9 @@ use axum::{
     extract::{Path, State},
     response::{Html, IntoResponse},
 };
-use multithreaded_kv_store::{AppState, StoreEngine};
+use multithreaded_kv_store::AppState;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -54,28 +54,28 @@ pub async fn create_kv(
     State(app_state): State<Arc<AppState>>,
     Path(kv_store_name): Path<String>,
 ) -> impl IntoResponse {
-    println!("/create_kv called!");
-    let stores_map = app_state.get_stores_map_clone();
+    println!("/create_kv/{kv_store_name}");
+    // let stores_map = app_state.get_stores_map_clone();
 
-    match StoreEngine::connect(&kv_store_name, 65000) {
-        Ok(store_engine) => {
-            let mut stores_map_guard = stores_map.write().await;
-
-            stores_map_guard.insert(&kv_store_name, store_engine);
-
-            println!("{stores_map_guard:#?}");
-
-            Json(json!({
-                "status": "ok",
-                "message": "Server is running"
-            }))
-        }
+    match app_state.connect_store(&kv_store_name, 65000).await {
+        Ok(_) => Json(json!({
+            "status": "ok",
+            "message": kv_store_name + " connected successfully !",
+            "error": ""
+        })),
         Err(e) => Json(json!({
             "status": "ok",
             "message": "Server is running",
             "error": e
         })),
     }
+
+    //     Err(e) => Json(json!({
+    //         "status": "ok",
+    //         "message": "Server is running",
+    //         "error": e
+    //     })),
+    // }
 }
 
 #[axum::debug_handler]
@@ -251,37 +251,45 @@ pub async fn write_value(
     }
 }
 
-pub async fn fetch_full_kv_store(
+pub async fn fetch_initial_page_from_kv_store(
     State(app_state): State<Arc<AppState>>,
     Path(kv_store_name): Path<String>,
 ) -> impl IntoResponse {
-    let stores_map = app_state.get_stores_map_clone();
+    return fetch_pages(app_state, kv_store_name, 0,100).await;
+}
 
-    let kv_store = {
-        let stores_map_guard = stores_map.read().await;
-        stores_map_guard.get(&kv_store_name).clone()
-    };
+pub async fn fetch_page_kv_store(
+    State(app_state): State<Arc<AppState>>,
+    Path((kv_store_name, offset, limit)): Path<(String, usize, usize)>,
+) -> impl IntoResponse {
+    return fetch_pages(app_state, kv_store_name, offset, limit).await;
+}
 
-    println!("{kv_store:#?}");
-
-    match kv_store {
-        Some(kv_store) => {
-            let kv_output = kv_store.fetch_all().await;
-
-            Json(json!({
+pub async fn fetch_pages(
+    app_state: Arc<AppState>,
+    kv_store_name: String,
+    offset: usize,
+    limit: usize,
+) -> axum::Json<Value> {
+    let kv_ouput = app_state
+        .fetch_page_from_store(&kv_store_name, offset, limit)
+        .await;
+    match kv_ouput {
+        Ok(output) =>
+            return Json(json!({
                 "status": "ok",
                 "message": "opearation was successful",
                 "kv_store_name": kv_store_name,
                 "operation_status": true,
-                "kv_output": kv_output
-            }))
-        }
-        None => Json(json!({
+                "kv_output": output
+            })),
+        Err(e) => return Json(json!({
             "status": "ok",
             "message": "There ain't any such KvStore",
+            "error" : e,
             "kv_store_name": kv_store_name,
             "operation_status": false,
             "kv_output": "Not Found"
-        })),
-    }
+        }))
+    };
 }
